@@ -11,41 +11,36 @@ dotenv.config();
 const app = express();
 const port = process.env.PORT || 3003;
 
-const allowedOrigins = [process.env.FRONTEND_URL || 'http://localhost:3000'];
-
+// ✅ CORS middleware — allow frontend URL from env or localhost
 app.use(cors({
-    origin: function(origin, callback) {
-        if (!origin) return callback(null, true); // allow requests like Postman or server-to-server
-        if (allowedOrigins.indexOf(origin) !== -1) {
-            callback(null, true);
-        } else {
-            callback(new Error('CORS policy: Not allowed origin'));
-        }
-    },
+    origin: [process.env.FRONTEND_URL || 'http://localhost:3000'],
     methods: ['GET', 'POST', 'PUT', 'DELETE'],
     credentials: true
 }));
 
-// Explicitly handle OPTIONS preflight requests
-app.options('*', cors());
-
+// ✅ Body parsers
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
+// ✅ EJS setup
 app.set("view engine", "ejs");
 
+// ✅ Make env URLs available to EJS templates (optional)
 app.use((req, res, next) => {
     res.locals.apiBaseUrl = process.env.BACKEND_URL || `http://localhost:${port}`;
     res.locals.frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
     next();
 });
 
+// ✅ Routes
 app.use("/", userManagementController);
 
+// ✅ DB connection check
 db.query("SELECT 1")
     .then(() => console.log('DB connection succeeded.'))
     .catch(err => console.log('DB connection failed.\n' + err));
 
+// ✅ Start server
 app.listen(port, () => {
     console.log(`Server running on port ${port}`);
 });
