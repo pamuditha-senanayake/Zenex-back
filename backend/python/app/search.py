@@ -7,10 +7,15 @@ from app.db import get_db_connection
 
 router = APIRouter()
 
+# --- Pydantic Models ---
 class MomentSolution(BaseModel):
     id: int
     moment: str
     solution: str
+    has_solution: bool # NEW FIELD: Indicates if a solution is known for this moment
+
+    class Config:
+        from_attributes = True # Required for Pydantic v2 to map ORM objects
 
 class MomentSolutionCreate(BaseModel):
     moment: str
@@ -59,16 +64,16 @@ async def generate_embedding(text: str) -> List[float]:
             )
         response.raise_for_status() # Raise an exception for bad HTTP status codes (4xx or 5xx)
         embedding_data = response.json()
-        
+
         # Parse the embedding values from the API response
         # The structure is response["embedding"]["values"]
         embedding = embedding_data.get("embedding", {}).get("values")
-        
+
         if not embedding:
             # If embedding values are missing, check for an error message from the API
             error_detail = embedding_data.get("error", {}).get("message", "No embedding values found in Gemini API response.")
             raise ValueError(f"Gemini API returned no embedding: {error_detail}")
-            
+
         return embedding
     except httpx.HTTPStatusError as e:
         print(f"HTTP error from Gemini Embedding API: Status {e.response.status_code} - Detail: {e.response.text}")
@@ -83,17 +88,23 @@ async def generate_embedding(text: str) -> List[float]:
             detail=f"Failed to generate embedding: {str(e)}. Please check your API key and network."
         )
 
-# --- Existing endpoints (get_all_moments, delete_moment) remain largely unchanged ---
+# --- Moment & Solution Endpoints ---
 
 @router.get("/api/moments", response_model=List[MomentSolution])
 async def get_all_moments():
+    """Retrieves all stored moments and their solutions, including their solution status."""
     conn = await get_db_connection()
-    rows = await conn.fetch("SELECT id, moment, solution FROM moments ORDER BY id DESC LIMIT 100")
-    await conn.close()
-    return [MomentSolution(id=row['id'], moment=row['moment'], solution=row['solution']) for row in rows]
+    try:
+        # Select the new 'has_solution' column
+        rows = await conn.fetch("SELECT id, moment, solution, has_solution FROM moments ORDER BY id DESC LIMIT 100")
+    finally:
+        await conn.close()
+    # Ensure has_solution is passed to the Pydantic model
+    return [MomentSolution(id=row['id'], moment=row['moment'], solution=row['solution'], has_solution=row['has_solution']) for row in rows]
 
 @router.delete("/api/moments/{moment_id}", status_code=204)
 async def delete_moment(moment_id: int):
+    """Deletes a moment and its solution by ID."""
     conn = await get_db_connection()
     try:
         result = await conn.execute("DELETE FROM moments WHERE id=$1", moment_id)
@@ -103,48 +114,58 @@ async def delete_moment(moment_id: int):
         raise HTTPException(status_code=404, detail="Moment not found")
     return
 
-# --- Modified endpoints to store embeddings ---
-
 @router.post("/api/moments", response_model=MomentSolution, status_code=201)
 async def create_moment(create_data: MomentSolutionCreate):
+    """
+    Creates a new moment and solution, generates an embedding, and stores it.
+    New moments default to having a solution (has_solution = TRUE).
+    """
     conn = await get_db_connection()
-    
+
     # Generate embedding for the new moment's content
-    # It's good practice to embed both moment and solution for richer context
     combined_text = f"{create_data.moment} {create_data.solution}"
     embedding = await generate_embedding(combined_text)
-    
+
     try:
+        # Insert with default has_solution = TRUE and return the new field
         row = await conn.fetchrow(
-            "INSERT INTO moments(moment, solution, embedding) VALUES($1, $2, $3) RETURNING id, moment, solution",
-            create_data.moment, create_data.solution, embedding
+            "INSERT INTO moments(moment, solution, embedding, has_solution) VALUES($1, $2, $3, $4) RETURNING id, moment, solution, has_solution",
+            create_data.moment, create_data.solution, embedding, True # Default has_solution to True
         )
     finally:
         await conn.close()
-        
-    return MomentSolution(id=row['id'], moment=row['moment'], solution=row['solution'])
+
+    # Ensure has_solution is passed to the Pydantic model
+    return MomentSolution(id=row['id'], moment=row['moment'], solution=row['solution'], has_solution=row['has_solution'])
 
 @router.put("/api/moments/{moment_id}", response_model=MomentSolution)
 async def update_moment(moment_id: int, update_data: MomentSolutionUpdate):
+    """
+    Updates an existing moment's text and solution, and re-generates its embedding.
+    The 'has_solution' status is updated via a separate endpoint (in problem_logging.py).
+    """
     conn = await get_db_connection()
-    
+
     # Generate new embedding for the updated moment's content
     combined_text = f"{update_data.moment} {update_data.solution}"
     embedding = await generate_embedding(combined_text)
-    
+
     try:
+        # Update moment and solution, but has_solution is NOT updated here.
+        # However, we still RETURN has_solution to keep the response model consistent.
         row = await conn.fetchrow(
-            "UPDATE moments SET moment=$1, solution=$2, embedding=$3 WHERE id=$4 RETURNING id, moment, solution",
+            "UPDATE moments SET moment=$1, solution=$2, embedding=$3 WHERE id=$4 RETURNING id, moment, solution, has_solution",
             update_data.moment, update_data.solution, embedding, moment_id
         )
     finally:
         await conn.close()
-        
+
     if not row:
         raise HTTPException(status_code=404, detail="Moment not found")
-    return MomentSolution(id=row['id'], moment=row['moment'], solution=row['solution'])
+    # Ensure has_solution is passed to the Pydantic model
+    return MomentSolution(id=row['id'], moment=row['moment'], solution=row['solution'], has_solution=row['has_solution'])
 
-# --- New Vector Similarity Search Endpoint ---
+# --- Vector Similarity Search Endpoint ---
 @router.get("/api/search-moments", response_model=List[MomentSolution])
 async def search_moments(
     query: str = Query(..., min_length=1, description="The user's search query."),
@@ -162,19 +183,18 @@ async def search_moments(
         # 2. Query PostgreSQL using pgvector <-> operator for closest matches
         # The <-> operator calculates Euclidean distance. A smaller distance means a closer match.
         # ORDER BY embedding <-> $1 ensures results are ordered by similarity (closest first).
+        # Also select the new 'has_solution' column
         rows = await conn.fetch(
-            "SELECT id, moment, solution FROM moments ORDER BY embedding <-> $1 LIMIT $2",
+            "SELECT id, moment, solution, has_solution FROM moments ORDER BY embedding <-> $1 LIMIT $2",
             query_embedding, top_k
         )
     finally:
         await conn.close()
 
-    # 3. Return the found moments
-    return [MomentSolution(id=row['id'], moment=row['moment'], solution=row['solution']) for row in rows]
+    # 3. Return the found moments, ensuring has_solution is included
+    return [MomentSolution(id=row['id'], moment=row['moment'], solution=row['solution'], has_solution=row['has_solution']) for row in rows]
 
 # --- Optional: Endpoint to migrate existing moments to have embeddings ---
-# This is a one-time operation to populate the 'embedding' column for existing data
-# that was created before the 'embedding' column or its population logic was in place.
 @router.post("/api/migrate-existing-moments-embeddings", status_code=200)
 async def migrate_existing_moments_embeddings():
     """
@@ -186,6 +206,7 @@ async def migrate_existing_moments_embeddings():
     failed_count = 0
     try:
         # Fetch moments that do not have an embedding yet (where embedding IS NULL)
+        # Note: This migration does not handle 'has_solution' as it's a separate concern.
         rows_to_process = await conn.fetch("SELECT id, moment, solution FROM moments WHERE embedding IS NULL")
         
         if not rows_to_process:
