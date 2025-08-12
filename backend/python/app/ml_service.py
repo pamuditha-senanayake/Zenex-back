@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta,timezone
 import joblib
 import os
 import asyncio # For async operations within a synchronous script
@@ -240,7 +240,7 @@ async def train_model_async():
         return
 
     # Split data into training and testing sets
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=None)
 
     # Calculate `scale_pos_weight` for handling class imbalance (if occurrences are rare)
     scale_pos_weight = (len(y_train) - y_train.sum()) / y_train.sum() if y_train.sum() > 0 else 1.0
@@ -339,7 +339,7 @@ async def get_predictions_for_display():
         """)
 
         predictions_output = []
-        current_time = datetime.now() # The time at which we are making the prediction
+        current_time = datetime.now(timezone.utc) # The time at which we are making the prediction
 
         for row in rows:
             # Convert asyncpg.Record to dictionary for consistent DataFrame creation
@@ -354,8 +354,9 @@ async def get_predictions_for_display():
             # Cyclical time features based on the *current time* (prediction time)
             current_moment_df['day_of_week'] = current_time.weekday()
             current_moment_df['hour_of_day'] = current_time.hour
-            current_moment_df['day_of_year'] = current_time.dayofyear
-            current_moment_df['week_of_year'] = current_time.isocalendar().week.astype(int)
+            current_moment_df['day_of_year'] = current_time.timetuple().tm_yday
+            current_moment_df['week_of_year'] = current_time.isocalendar().week
+
 
             # Rolling counts for current prediction:
             # These are challenging to compute accurately for a single row without more history.
